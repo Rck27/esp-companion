@@ -1,2 +1,2 @@
-idf_component_register(SRCS "vl53l1x.c" "main.c"
+idf_component_register(SRCS "main.c" "core/src/vl53l1_platform.c" "core/src/VL53L1X_api.c" "core/src/VL53L1X_calibration.c" "esp_wrapper/src/i2c_device_handler.c" "esp_wrapper/src/i2c_handler.c" "esp_wrapper/src/vl53l1x.c"
                     INCLUDE_DIRS ".")

@@ -7,8 +7,9 @@
 #include "driver/uart.h"
 #include "driver/gpio.h"
 #include "esp_log.h"
+#include "esp_wrapper/include/vl53l1x.h"
 
-// --- CONFIG ---
+
 #define MSP_RX_PIN      (GPIO_NUM_18)
 #define MSP_TX_PIN      (GPIO_NUM_19)
 #define MSP_UART_NUM    (UART_NUM_2)
@@ -16,7 +17,125 @@
 #define RX_BUF_SIZE     (1024)
 #define MAX_CHANNELS    16 
 
-static const char *TAG = "MSP_PAGE";
+#define MIN_DISTACE_MM  200
+#define MAX_DISTANCE_MM 2000
+#define MAX_PWM_DIFF 500
+#define MIN_PWM_DIFF 0
+
+#define sdaPin 21
+#define sclPin 22
+
+#define xShutA 16
+#define xShutB 17
+#define xShutC 5
+
+enum sensor_pos {
+    FRONT=0,
+    LEFT,
+    RIGHT
+};
+
+int8_t xShut_arr[3] = {16, 17, 5};
+int8_t adress_arr[3] = {0x30, 0x31, 0x32};
+vl53l1x_device_handle_t device_arr[3] = {VL53L1X_DEVICE_INIT, VL53L1X_DEVICE_INIT, VL53L1X_DEVICE_INIT};
+uint16_t distance[3] = {0, 0, 0};
+
+static const char *TAG = "VL53L1X";
+
+static vl53l1x_i2c_handle_t i2cHandle = VL53L1X_I2C_INIT;
+static vl53l1x_handle_t vl53 = VL53L1X_INIT;
+
+
+uint16_t sA, sB, sC = 0;
+
+#define APF_DETECT_DIST_CM  200.0f  // Force starts here (2 meters)
+#define APF_MIN_DIST_CM     20.0f   // Max force reached here (20 cm)
+#define APF_MAX_MODIFIER    500     // Max PWM change (+/- 500)
+#define APF_GAIN            15000.0f // Tuning knob (Higher = stronger reaction)
+
+// Calculate Repulsive Force based on distance
+// Returns: 0 to APF_MAX_MODIFIER
+int16_t calculate_apf_force(float distance_cm) {
+    // 1. If we are far away, no force
+    if (distance_cm >= APF_DETECT_DIST_CM || distance_cm <= 0) {
+        return 0;
+    }
+
+    // 2. Safety: Don't divide by zero or negative numbers
+    if (distance_cm < 1.0f) distance_cm = 1.0f;
+
+    // 3. The Formula: F = Gain * (1/dist - 1/limit)
+    // This creates a curve: gentle at 200cm, extreme at 20cm
+    float force = APF_GAIN * ( (1.0f / distance_cm) - (1.0f / APF_DETECT_DIST_CM) );
+
+    // 4. Convert to Integer
+    int16_t pwm_adjust = (int16_t)force;
+
+    // 5. Clamp the result
+    if (pwm_adjust > APF_MAX_MODIFIER) pwm_adjust = APF_MAX_MODIFIER;
+    if (pwm_adjust < 0) pwm_adjust = 0;
+
+    return pwm_adjust;
+}
+
+
+
+int map_range(int value, int in_min, int in_max, int out_min, int out_max) {
+    return (value - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
+}
+
+static void gpio_init(gpio_num_t pin)
+{
+    gpio_reset_pin(pin);
+    gpio_set_direction(pin, GPIO_MODE_OUTPUT);
+}
+
+int init_sensors()
+{   
+    int err_count = 0;
+    ESP_LOGI(TAG,"Init sensors...");
+
+    for(int i = 0; i < 3; i++)
+    {
+        gpio_init(xShut_arr[i]);
+        gpio_set_level(xShut_arr[i],0);
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    i2cHandle.scl_gpio = sclPin;
+    i2cHandle.sda_gpio = sdaPin;
+
+    vl53.i2c_handle = &i2cHandle;
+    if(!vl53l1x_init(&vl53))
+    {
+        ESP_LOGE(TAG,"Failed init VL53 core");
+        return 0;
+    }
+
+    for(int i = 0; i < 3; i++)
+    {
+        gpio_set_level(xShut_arr[i],1);
+        vTaskDelay(pdMS_TO_TICKS(20));
+
+        device_arr[i].vl53l1x_handle = &vl53;
+        device_arr[i].xshut_gpio = xShut_arr[i];
+
+        if(!vl53l1x_add_device(&device_arr[i]))
+        {
+            ESP_LOGE(TAG,"Add Sensor %d failed", i);
+            err_count++;
+            continue;
+        }
+
+        vl53l1x_update_device_address(&device_arr[i], adress_arr[i]);
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    ESP_LOGI(TAG,"Done init sensors");
+    return err_count;
+}
+
+
 
 // --- CHANNEL MAPPING ---
 // Array Indices (0-15) corresponding to Channels (1-16)
@@ -151,9 +270,13 @@ void control_task(void *pvParameters) {
         }
 
         // --- 3. STICK LOGIC ---
-        int sensor_offset = (int)(sin(loop_counter * 0.1) * 200);
-        
-        output_rc[OUT_ROLL]  = input_rc[IN_ROLL_MIRROR] + sensor_offset;
+        int sensor_offset = (int)(sin(loop_counter * 0.1) * 10);
+        int16_t force_from_left = calculate_apf_force(distance[LEFT]);
+        int16_t force_from_right = calculate_apf_force(distance[RIGHT]);
+
+        ESP_LOGI("APF", "dist right: %d cm | force: %d, dist left: %d | force : %d", distance[RIGHT]/10, force_from_right, distance[LEFT]/10, force_from_left);
+
+        output_rc[OUT_ROLL]  = input_rc[IN_ROLL_MIRROR] + force_from_left - force_from_right;
         output_rc[OUT_PITCH] = input_rc[IN_PITCH_MIRROR];
         output_rc[OUT_YAW]   = input_rc[IN_YAW_MIRROR];
         output_rc[OUT_THR]   = input_rc[IN_THR_MIRROR];
@@ -194,9 +317,30 @@ void control_task(void *pvParameters) {
     }
 }
 
+
+void sensor_task(void *pvParameters) {
+    init_sensors();
+
+    while(1)
+    {
+        for(int i = 0; i < 3; i++)
+        {
+            distance[i] = vl53l1x_get_mm(&device_arr[i]);
+        }
+
+        // ESP_LOGI(TAG,"A=%d mm | B=%d mm | C=%d mm", distance[FRONT], distance[LEFT], distance[RIGHT]);
+        // ESP_LOGI("APF", "left %d right %d", apf(distance[LEFT]), apf(distance[RIGHT]));
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+}
+
+
+
+
 void app_main(void) {
     init_uart();
     xDroneStateMutex = xSemaphoreCreateMutex();
+    xTaskCreatePinnedToCore(sensor_task, "SENSOR", 4096, NULL, 6, NULL, 0);
     xTaskCreatePinnedToCore(rx_task, "RX", 4096, NULL, 5, NULL, 1);
     xTaskCreatePinnedToCore(control_task, "CTRL", 4096, NULL, 4, NULL, 1);
 }
