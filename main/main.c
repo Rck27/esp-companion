@@ -10,10 +10,10 @@
 #include "esp_wrapper/include/vl53l1x.h"
 
 
-#define MSP_RX_PIN      (GPIO_NUM_18)
-#define MSP_TX_PIN      (GPIO_NUM_19)
+#define MSP_RX_PIN      (GPIO_NUM_19)
+#define MSP_TX_PIN      (GPIO_NUM_18)
 #define MSP_UART_NUM    (UART_NUM_2)
-#define MSP_BAUD_RATE   (115200)
+#define MSP_BAUD_RATE   (230400)
 #define RX_BUF_SIZE     (1024)
 #define MAX_CHANNELS    16 
 
@@ -35,21 +35,27 @@ enum sensor_pos {
     RIGHT
 };
 
-int8_t xShut_arr[3] = {16, 17, 5};
+enum attitude_index {
+    ROLL=0,
+    PITCH,
+    YAW
+};
+
+int8_t xShut_arr[3] = {17, 16, 4};
 int8_t adress_arr[3] = {0x30, 0x31, 0x32};
 vl53l1x_device_handle_t device_arr[3] = {VL53L1X_DEVICE_INIT, VL53L1X_DEVICE_INIT, VL53L1X_DEVICE_INIT};
-uint16_t distance[3] = {0, 0, 0};
+volatile uint16_t distance[3] = {0, 0, 0};
 
 static const char *TAG = "VL53L1X";
 
 static vl53l1x_i2c_handle_t i2cHandle = VL53L1X_I2C_INIT;
 static vl53l1x_handle_t vl53 = VL53L1X_INIT;
 
+volatile int16_t attitude[3] = {0,0,0}; // roll, pitch, yaw
 
-uint16_t sA, sB, sC = 0;
 
-#define APF_DETECT_DIST_CM  200.0f  // Force starts here (2 meters)
-#define APF_MIN_DIST_CM     20.0f   // Max force reached here (20 cm)
+#define APF_DETECT_DIST_CM  450.0f  // Force starts here (2 meters)
+#define APF_MIN_DIST_CM     50.0f   // Max force reached here (20 cm)
 #define APF_MAX_MODIFIER    500     // Max PWM change (+/- 500)
 #define APF_GAIN            15000.0f // Tuning knob (Higher = stronger reaction)
 
@@ -105,8 +111,9 @@ int init_sensors()
 
     i2cHandle.scl_gpio = sclPin;
     i2cHandle.sda_gpio = sdaPin;
-
+    
     vl53.i2c_handle = &i2cHandle;
+    
     if(!vl53l1x_init(&vl53))
     {
         ESP_LOGE(TAG,"Failed init VL53 core");
@@ -161,7 +168,8 @@ enum rc_map {
 };
 
 #define MSP_CMD_RC          105 
-#define MSP_CMD_SET_RAW_RC  200 
+#define MSP_CMD_SET_RAW_RC  200
+#define MSP_CMD_ATTITUDE    108 
 
 uint16_t global_rc[MAX_CHANNELS]; 
 SemaphoreHandle_t xDroneStateMutex = NULL;
@@ -176,6 +184,8 @@ void init_uart() {
         .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
         .source_clk = UART_SCLK_DEFAULT,
     };
+
+
     uart_driver_install(MSP_UART_NUM, RX_BUF_SIZE * 2, 0, 0, NULL, 0);
     uart_param_config(MSP_UART_NUM, &uart_config);
     uart_set_pin(MSP_UART_NUM, MSP_TX_PIN, MSP_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
@@ -218,6 +228,22 @@ void process_msp_byte(uint8_t byte) {
                     xSemaphoreGive(xDroneStateMutex);
                 }
             }
+            else if(calc_crc == byte && msg_cmd == MSP_CMD_ATTITUDE){
+                if (xSemaphoreTake(xDroneStateMutex, portMAX_DELAY)) {
+                    if (msg_len >= 6) {
+                        attitude[ROLL]  = (rx_buf[0] | (rx_buf[1] << 8));
+                        attitude[PITCH] = (rx_buf[2] | (rx_buf[3] << 8));
+                        attitude[YAW]   = (rx_buf[4] | (rx_buf[5] << 8));
+                    }
+                    else {
+                        ESP_LOGE(TAG, "Attitude payload too short");
+                    }
+                    xSemaphoreGive(xDroneStateMutex);
+                }
+                else {
+                    ESP_LOGE(TAG, "Failed to take mutex for attitude");
+                }
+            }
             state = 0; break;
         default: state = 0; break;
     }
@@ -229,6 +255,7 @@ void rx_task(void *pvParameters) {
         int len = uart_read_bytes(MSP_UART_NUM, data, RX_BUF_SIZE, 10 / portTICK_PERIOD_MS);
         if (len > 0) for (int i = 0; i < len; i++) process_msp_byte(data[i]);
     }
+    free(data);
 }
 
 
@@ -254,14 +281,10 @@ void control_task(void *pvParameters) {
         for(int i=0; i<3; i++) memory_bank[p][i] = 1500;
     }
 
-    int loop_counter = 0;
-
     while (1) {
-        loop_counter++;
 
         // 1. Request Data (Returns Physical Ch 8-16 + Echo Ch 1-7)
         msp_send_packet(MSP_CMD_RC, NULL, 0);
-        vTaskDelay(15 / portTICK_PERIOD_MS); 
 
         // 2. Read Snapshot
         if (xSemaphoreTake(xDroneStateMutex, portMAX_DELAY)) {
@@ -270,13 +293,12 @@ void control_task(void *pvParameters) {
         }
 
         // --- 3. STICK LOGIC ---
-        int sensor_offset = (int)(sin(loop_counter * 0.1) * 10);
-        int16_t force_from_left = calculate_apf_force(distance[LEFT]);
-        int16_t force_from_right = calculate_apf_force(distance[RIGHT]);
+        uint16_t force_from_left = calculate_apf_force(distance[LEFT]);
+        uint16_t force_from_right = calculate_apf_force(distance[RIGHT]);
 
-        ESP_LOGI("APF", "dist right: %d cm | force: %d, dist left: %d | force : %d", distance[RIGHT]/10, force_from_right, distance[LEFT]/10, force_from_left);
 
-        output_rc[OUT_ROLL]  = input_rc[IN_ROLL_MIRROR] + force_from_left - force_from_right;
+        // output_rc[OUT_ROLL]  = input_rc[IN_ROLL_MIRROR] + force_from_left - force_from_right;
+        output_rc[OUT_ROLL]  = input_rc[IN_ROLL_MIRROR];
         output_rc[OUT_PITCH] = input_rc[IN_PITCH_MIRROR];
         output_rc[OUT_YAW]   = input_rc[IN_YAW_MIRROR];
         output_rc[OUT_THR]   = input_rc[IN_THR_MIRROR];
@@ -307,13 +329,9 @@ void control_task(void *pvParameters) {
         }
         msp_send_packet(MSP_CMD_SET_RAW_RC, payload, 32);
 
-        // Debug
-        if (loop_counter % 50 == 0) {
-             ESP_LOGI(TAG, "Page:%d | Aux1:%d | Aux2:%d | Aux3:%d", 
-                page, output_rc[OUT_AUX1], output_rc[OUT_AUX2], output_rc[OUT_AUX3]);
-        }
+        msp_send_packet(MSP_CMD_ATTITUDE, NULL, 0);
 
-        vTaskDelay(20 / portTICK_PERIOD_MS); 
+
     }
 }
 
@@ -323,24 +341,32 @@ void sensor_task(void *pvParameters) {
 
     while(1)
     {
-        for(int i = 0; i < 3; i++)
+        for(int i = 0; i < 2; i++)
         {
             distance[i] = vl53l1x_get_mm(&device_arr[i]);
+            vTaskDelay(5 / portTICK_PERIOD_MS);
         }
 
-        // ESP_LOGI(TAG,"A=%d mm | B=%d mm | C=%d mm", distance[FRONT], distance[LEFT], distance[RIGHT]);
-        // ESP_LOGI("APF", "left %d right %d", apf(distance[LEFT]), apf(distance[RIGHT]));
-        vTaskDelay(pdMS_TO_TICKS(50));
     }
 }
 
 
-
+void log_task(){
+    while(1){
+        if (xSemaphoreTake(xDroneStateMutex, portMAX_DELAY)) {
+            ESP_LOGI("ATT", "Roll: %d | Pitch: %d | Yaw: %d", attitude[ROLL] / 10, attitude[PITCH] / 10, attitude[YAW] / 10);
+            ESP_LOGI(TAG,"A=%d mm | B=%d mm | C=%d mm", distance[FRONT], distance[LEFT], distance[RIGHT]);
+            xSemaphoreGive(xDroneStateMutex);
+        }
+        vTaskDelay(50 / portTICK_PERIOD_MS);
+    }
+}
 
 void app_main(void) {
     init_uart();
     xDroneStateMutex = xSemaphoreCreateMutex();
     xTaskCreatePinnedToCore(sensor_task, "SENSOR", 4096, NULL, 6, NULL, 0);
-    xTaskCreatePinnedToCore(rx_task, "RX", 4096, NULL, 5, NULL, 1);
-    xTaskCreatePinnedToCore(control_task, "CTRL", 4096, NULL, 4, NULL, 1);
+    xTaskCreatePinnedToCore(rx_task, "RX", 4096, NULL, 5, NULL, 0);
+    xTaskCreatePinnedToCore(control_task, "CTRL", 4096, NULL, 6, NULL, 1);
+    xTaskCreatePinnedToCore(log_task, "LOG", 4096, NULL, 3, NULL, 1);
 }
